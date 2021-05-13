@@ -22,7 +22,6 @@
 #include <pwd.h>
 #include <sched.h>
 #include <signal.h>
-#include <statslog_lmkd.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +29,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/pidfd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -147,15 +147,6 @@
 
 #define LMKD_REINIT_PROP "lmkd.reinit"
 
-static inline int sys_pidfd_open(pid_t pid, unsigned int flags) {
-    return syscall(__NR_pidfd_open, pid, flags);
-}
-
-static inline int sys_pidfd_send_signal(int pidfd, int sig, siginfo_t *info,
-                                        unsigned int flags) {
-    return syscall(__NR_pidfd_send_signal, pidfd, sig, info, flags);
-}
-
 /* default to old in-kernel interface if no memory pressure events */
 static bool use_inkernel_interface = true;
 static bool has_inkernel_module;
@@ -205,6 +196,7 @@ static int psi_partial_stall_ms;
 static int psi_complete_stall_ms;
 static int thrashing_limit_pct;
 static int thrashing_limit_decay_pct;
+static int thrashing_critical_pct;
 static int swap_util_max;
 static bool use_psi_monitors = false;
 static int kpoll_fd;
@@ -765,6 +757,49 @@ static void ctrl_data_write_lmk_kill_occurred(pid_t pid, uid_t uid) {
     }
 }
 
+/*
+ * Write the kill_stat/memory_stat over the data socket to be propagated via AMS to statsd
+ */
+static void stats_write_lmk_kill_occurred(struct kill_stat *kill_st,
+                                          struct memory_stat *mem_st) {
+    LMK_KILL_OCCURRED_PACKET packet;
+    const size_t len = lmkd_pack_set_kill_occurred(packet, kill_st, mem_st);
+    if (len == 0) {
+        return;
+    }
+
+    for (int i = 0; i < MAX_DATA_CONN; i++) {
+        if (data_sock[i].sock >= 0 && data_sock[i].async_event_mask & 1 << LMK_ASYNC_EVENT_STAT) {
+            ctrl_data_write(i, packet, len);
+        }
+    }
+
+}
+
+static void stats_write_lmk_kill_occurred_pid(int pid, struct kill_stat *kill_st,
+                                              struct memory_stat *mem_st) {
+    kill_st->taskname = stats_get_task_name(pid);
+    if (kill_st->taskname != NULL) {
+        stats_write_lmk_kill_occurred(kill_st, mem_st);
+    }
+}
+
+/*
+ * Write the state_changed over the data socket to be propagated via AMS to statsd
+ */
+static void stats_write_lmk_state_changed(enum lmk_state state) {
+    LMKD_CTRL_PACKET packet_state_changed;
+    const size_t len = lmkd_pack_set_state_changed(packet_state_changed, state);
+    if (len == 0) {
+        return;
+    }
+    for (int i = 0; i < MAX_DATA_CONN; i++) {
+        if (data_sock[i].sock >= 0 && data_sock[i].async_event_mask & 1 << LMK_ASYNC_EVENT_STAT) {
+            ctrl_data_write(i, (char*)packet_state_changed, len);
+        }
+    }
+}
+
 static void poll_kernel(int poll_fd) {
     if (poll_fd == -1) {
         // not waiting
@@ -1135,7 +1170,7 @@ static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred 
         int pidfd = -1;
 
         if (pidfd_supported) {
-            pidfd = TEMP_FAILURE_RETRY(sys_pidfd_open(params.pid, 0));
+            pidfd = TEMP_FAILURE_RETRY(pidfd_open(params.pid, 0));
             if (pidfd < 0) {
                 ALOGE("pidfd_open for pid %d failed; errno=%d", params.pid, errno);
                 return;
@@ -1157,9 +1192,10 @@ static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred 
     } else {
         if (!claim_record(procp, cred->pid)) {
             char buf[LINE_MAX];
+            char *taskname = proc_get_name(cred->pid, buf, sizeof(buf));
             /* Only registrant of the record can remove it */
             ALOGE("%s (%d, %d) attempts to modify a process registered by another client",
-                proc_get_name(cred->pid, buf, sizeof(buf)), cred->uid, cred->pid);
+                taskname ? taskname : "A process ", cred->uid, cred->pid);
             return;
         }
         proc_unslot(procp);
@@ -1194,9 +1230,10 @@ static void cmd_procremove(LMKD_CTRL_PACKET packet, struct ucred *cred) {
 
     if (!claim_record(procp, cred->pid)) {
         char buf[LINE_MAX];
+        char *taskname = proc_get_name(cred->pid, buf, sizeof(buf));
         /* Only registrant of the record can remove it */
         ALOGE("%s (%d, %d) attempts to unregister a process registered by another client",
-            proc_get_name(cred->pid, buf, sizeof(buf)), cred->uid, cred->pid);
+            taskname ? taskname : "A process ", cred->uid, cred->pid);
         return;
     }
 
@@ -1865,7 +1902,7 @@ static void record_wakeup_time(struct timespec *tm, enum wakeup_reason reason,
 }
 
 static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
-                         int kill_reason, union meminfo *mi,
+                         int swap_kb, int kill_reason, union meminfo *mi,
                          struct wakeup_info *wi, struct timespec *tm) {
     /* log process information */
     android_log_write_int32(ctx, procp->pid);
@@ -1885,6 +1922,7 @@ static void killinfo_log(struct proc* procp, int min_oom_score, int rss_kb,
     android_log_write_int32(ctx, (int32_t)get_time_diff_ms(&wi->prev_wakeup_tm, tm));
     android_log_write_int32(ctx, wi->wakeups_since_event);
     android_log_write_int32(ctx, wi->skipped_wakeups);
+    android_log_write_int32(ctx, (int32_t)min(swap_kb, INT32_MAX));
 
     android_log_write_list(ctx, LOG_ID_EVENTS);
     android_log_reset(ctx);
@@ -1902,7 +1940,7 @@ static struct proc *proc_get_heaviest(int oomadj) {
     while (curr != head) {
         int pid = ((struct proc *)curr)->pid;
         int tasksize = proc_get_size(pid);
-        if (tasksize <= 0) {
+        if (tasksize < 0) {
             struct adjslot_list *next = curr->next;
             pid_remove(pid);
             curr = next;
@@ -2102,7 +2140,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, enum kill_rea
         r = kill(pid, SIGKILL);
     } else {
         start_wait_for_proc_kill(pidfd);
-        r = sys_pidfd_send_signal(pidfd, SIGKILL, NULL, 0);
+        r = pidfd_send_signal(pidfd, SIGKILL, NULL, 0);
     }
 
     TRACE_KILL_END();
@@ -2120,14 +2158,14 @@ static int kill_one_process(struct proc* procp, int min_oom_score, enum kill_rea
 
     inc_killcnt(procp->oomadj);
 
-    killinfo_log(procp, min_oom_score, rss_kb, kill_reason, mi, wi, tm);
+    killinfo_log(procp, min_oom_score, rss_kb, swap_kb, kill_reason, mi, wi, tm);
 
     if (kill_desc) {
-        ALOGI("Kill '%s' (%d), uid %d, oom_adj %d to free %" PRId64 "kB; reason: %s", taskname, pid,
-              uid, procp->oomadj, rss_kb, kill_desc);
+        ALOGI("Kill '%s' (%d), uid %d, oom_score_adj %d to free %" PRId64 "kB rss, %" PRId64
+              "kB swap; reason: %s", taskname, pid, uid, procp->oomadj, rss_kb, swap_kb, kill_desc);
     } else {
-        ALOGI("Kill '%s' (%d), uid %d, oom_adj %d to free %" PRId64 "kB", taskname, pid,
-              uid, procp->oomadj, rss_kb);
+        ALOGI("Kill '%s' (%d), uid %d, oom_score_adj %d to free %" PRId64 "kB rss, %" PRId64
+              "kb swap", taskname, pid, uid, procp->oomadj, rss_kb, swap_kb);
     }
 
     kill_st.uid = static_cast<int32_t>(uid);
@@ -2153,7 +2191,7 @@ out:
 }
 
 /*
- * Find one process to kill at or above the given oom_adj level.
+ * Find one process to kill at or above the given oom_score_adj level.
  * Returns size of the killed process.
  */
 static int find_and_kill_process(int min_score_adj, enum kill_reasons kill_reason,
@@ -2162,12 +2200,21 @@ static int find_and_kill_process(int min_score_adj, enum kill_reasons kill_reaso
     int i;
     int killed_size = 0;
     bool lmk_state_change_start = false;
+    bool choose_heaviest_task = kill_heaviest_task;
 
     for (i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
         struct proc *procp;
 
+        if (!choose_heaviest_task && i <= PERCEPTIBLE_APP_ADJ) {
+            /*
+             * If we have to choose a perceptible process, choose the heaviest one to
+             * hopefully minimize the number of victims.
+             */
+            choose_heaviest_task = true;
+        }
+
         while (true) {
-            procp = kill_heaviest_task ?
+            procp = choose_heaviest_task ?
                 proc_get_heaviest(i) : proc_adj_lru(i);
 
             if (!procp)
@@ -2178,8 +2225,7 @@ static int find_and_kill_process(int min_score_adj, enum kill_reasons kill_reaso
             if (killed_size >= 0) {
                 if (!lmk_state_change_start) {
                     lmk_state_change_start = true;
-                    stats_write_lmk_state_changed(
-                            android::lmkd::stats::LMK_STATE_CHANGED__STATE__START);
+                    stats_write_lmk_state_changed(STATE_START);
                 }
                 break;
             }
@@ -2190,7 +2236,7 @@ static int find_and_kill_process(int min_score_adj, enum kill_reasons kill_reaso
     }
 
     if (lmk_state_change_start) {
-        stats_write_lmk_state_changed(android::lmkd::stats::LMK_STATE_CHANGED__STATE__STOP);
+        stats_write_lmk_state_changed(STATE_STOP);
     }
 
     return killed_size;
@@ -2499,18 +2545,18 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         snprintf(kill_desc, sizeof(kill_desc), "device is low on swap (%" PRId64
             "kB < %" PRId64 "kB) and thrashing (%" PRId64 "%%)",
             mi.field.free_swap * page_k, swap_low_threshold * page_k, thrashing);
-        /* Do not kill perceptible apps unless below min watermark */
-        if (wmark > WMARK_MIN) {
+        /* Do not kill perceptible apps unless below min watermark or heavily thrashing */
+        if (wmark > WMARK_MIN && thrashing < thrashing_critical_pct) {
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
         }
     } else if (swap_is_low && wmark < WMARK_HIGH) {
         /* Both free memory and swap are low */
         kill_reason = LOW_MEM_AND_SWAP;
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and swap is low (%"
-            PRId64 "kB < %" PRId64 "kB)", wmark > WMARK_LOW ? "min" : "low",
+            PRId64 "kB < %" PRId64 "kB)", wmark < WMARK_LOW ? "min" : "low",
             mi.field.free_swap * page_k, swap_low_threshold * page_k);
-        /* Do not kill perceptible apps unless below min watermark */
-        if (wmark > WMARK_MIN) {
+        /* Do not kill perceptible apps unless below min watermark or heavily thrashing */
+        if (wmark > WMARK_MIN && thrashing < thrashing_critical_pct) {
             min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
         }
     } else if (wmark < WMARK_HIGH && swap_util_max < 100 &&
@@ -2521,24 +2567,28 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
          */
         kill_reason = LOW_MEM_AND_SWAP_UTIL;
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and swap utilization"
-            " is high (%d%% > %d%%)", wmark > WMARK_LOW ? "min" : "low",
+            " is high (%d%% > %d%%)", wmark < WMARK_LOW ? "min" : "low",
             swap_util, swap_util_max);
     } else if (wmark < WMARK_HIGH && thrashing > thrashing_limit) {
         /* Page cache is thrashing while memory is low */
         kill_reason = LOW_MEM_AND_THRASHING;
         snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached and thrashing (%"
-            PRId64 "%%)", wmark > WMARK_LOW ? "min" : "low", thrashing);
+            PRId64 "%%)", wmark < WMARK_LOW ? "min" : "low", thrashing);
         cut_thrashing_limit = true;
-        /* Do not kill perceptible apps because of thrashing */
-        min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+        /* Do not kill perceptible apps unless thrashing at critical levels */
+        if (thrashing < thrashing_critical_pct) {
+            min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+        }
     } else if (reclaim == DIRECT_RECLAIM && thrashing > thrashing_limit) {
         /* Page cache is thrashing while in direct reclaim (mostly happens on lowram devices) */
         kill_reason = DIRECT_RECL_AND_THRASHING;
         snprintf(kill_desc, sizeof(kill_desc), "device is in direct reclaim and thrashing (%"
             PRId64 "%%)", thrashing);
         cut_thrashing_limit = true;
-        /* Do not kill perceptible apps because of thrashing */
-        min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+        /* Do not kill perceptible apps unless thrashing at critical levels */
+        if (thrashing < thrashing_critical_pct) {
+            min_score_adj = PERCEPTIBLE_APP_ADJ + 1;
+        }
     }
 
     /* Kill a process if necessary */
@@ -2798,15 +2848,14 @@ do_kill:
 
         /* Log whenever we kill or when report rate limit allows */
         if (use_minfree_levels) {
-            ALOGI("Reclaimed %ldkB, cache(%ldkB) and "
-                "free(%" PRId64 "kB)-reserved(%" PRId64 "kB) below min(%ldkB) for oom_adj %d",
+            ALOGI("Reclaimed %ldkB, cache(%ldkB) and free(%" PRId64 "kB)-reserved(%" PRId64 "kB) "
+                "below min(%ldkB) for oom_score_adj %d",
                 pages_freed * page_k,
                 other_file * page_k, mi.field.nr_free_pages * page_k,
                 zi.totalreserve_pages * page_k,
                 minfree * page_k, min_score_adj);
         } else {
-            ALOGI("Reclaimed %ldkB at oom_adj %d",
-                pages_freed * page_k, min_score_adj);
+            ALOGI("Reclaimed %ldkB at oom_score_adj %d", pages_freed * page_k, min_score_adj);
         }
 
         if (report_skip_count > 0) {
@@ -3108,7 +3157,7 @@ static int init(void) {
     }
 
     /* check if kernel supports pidfd_open syscall */
-    pidfd = TEMP_FAILURE_RETRY(sys_pidfd_open(getpid(), 0));
+    pidfd = TEMP_FAILURE_RETRY(pidfd_open(getpid(), 0));
     if (pidfd < 0) {
         pidfd_supported = (errno != ENOSYS);
     } else {
@@ -3336,6 +3385,8 @@ static void update_props() {
         low_ram_device ? DEF_THRASHING_LOWRAM : DEF_THRASHING));
     thrashing_limit_decay_pct = clamp(0, 100, property_get_int32("ro.lmk.thrashing_limit_decay",
         low_ram_device ? DEF_THRASHING_DECAY_LOWRAM : DEF_THRASHING_DECAY));
+    thrashing_critical_pct = max(0, property_get_int32("ro.lmk.thrashing_limit_critical",
+        thrashing_limit_pct * 2));
     swap_util_max = clamp(0, 100, property_get_int32("ro.lmk.swap_util_max", 100));
 }
 
